@@ -1,0 +1,59 @@
+/* Frontend/style.css */
+body {
+    margin: 0;
+    padding: 0;
+    background-color: #0e1117; 
+    color: #FAFAFA;
+    font-family: Arial, sans-serif;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    min-height: 100vh;
+}
+
+.mobile-frame {
+    width: 100%;
+    max-width: 400px;
+    min-height: 800px; 
+    border-radius: 20px;
+    box-shadow: 0 0 20px rgba(0, 0, 0, 0.5);
+    background-color: #1a1d29;
+    padding: 20px;
+    overflow-y: auto;
+}
+
+/* Form ve Buton Stilleri */
+.form-group { margin-bottom: 15px; }
+input[type="text"], input[type="password"], select {
+    width: 100%;
+    padding: 10px;
+    border: 1px solid #4f89e9;
+    background-color: #262730;
+    color: #FAFAFA;
+    border-radius: 5px;
+    box-sizing: border-box; 
+}
+button {
+    padding: 10px 15px;
+    border: none;
+    border-radius: 5px;
+    cursor: pointer;
+    font-weight: bold;
+    transition: background-color 0.3s;
+}
+.btn-primary { background-color: #4f89e9; color: white; }
+.btn-danger { background-color: #dc3545; color: white; }
+.btn-success { background-color: #28a745; color: white; }
+.text-blue { color: #4f89e9; }
+
+/* Dashboard ve Grafik Stilleri */
+.metric {
+    background-color: #262730;
+    padding: 15px;
+    border-radius: 8px;
+    text-align: center;
+    margin-bottom: 10px;
+}
+.metric-value { font-size: 1.6em; font-weight: bold; }
+.metric-label { font-size: 0.8em; color: #aaaaaa; }
+.chart-container { margin-top: 20px; background-color: #FAFAFA; padding: 10px; border-radius: 8px;}
