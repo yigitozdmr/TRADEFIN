@@ -1,107 +1,101 @@
-# ML_Model/model_train.py (GÜNCEL VERSİYON)
-
+import yfinance as yf
 import pandas as pd
+import numpy as np
+from ta.momentum import RSIIndicator
+from ta.trend import MACD, SMAIndicator
 from sklearn.model_selection import train_test_split
 from sklearn.ensemble import RandomForestRegressor
-from sklearn.metrics import mean_squared_error, r2_score
-import os
-import glob
-import joblib 
+from sklearn.metrics import mean_squared_error, mean_absolute_error
 
-# --- PATH VE DOSYA AYARLARI ---
-# Betiğin bulunduğu yerden Data_source/Processed_Data klasörüne giden mutlak yol
-CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-PROCESSED_DATA_DIR = os.path.join(os.path.dirname(CURRENT_DIR), 'Data_source', 'Processed_Data')
-
-# Model ve Ticker eşleme dosyalarının kayıt yolu (ML_Model klasörünün içine kaydeder)
-MODEL_PATH = os.path.join(CURRENT_DIR, "random_forest_model.joblib")
-MAPPER_PATH = os.path.join(CURRENT_DIR, "ticker_mapping.joblib")
-
-# Modelleri kaydetmek için klasörü oluştur
-if not os.path.exists(CURRENT_DIR):
-    os.makedirs(CURRENT_DIR)
-
-# --- VERİ YÜKLEME ---
-
-def load_and_combine_data():
-    """Döviz kurlarıyla birleştirilmiş veri setlerini okur ve tek bir DataFrame'de birleştirir."""
+# 1. TEK VE MERKEZİ VERİ HAZIRLAMA FONKSİYONU
+def prepare_data(symbol):
+    print(f"{symbol} için veri çekiliyor...")
     
-    # Yeni oluşturulan *_final_processed.csv dosyalarını bulur
-    # BURADA GÜNCEL DOSYA ADI KULLANILIYOR: *_final_processed.csv
-    all_files = glob.glob(os.path.join(PROCESSED_DATA_DIR, "*_final_processed.csv"))
+    # Veriyi indir (Son 3 yıl)
+    df = yf.download(symbol, period="3y", interval="1d")
     
-    if not all_files:
-        print(f"HATA: Processed_Data klasöründe hiç *_final_processed.csv verisi bulunamadı! Lütfen data_merger_fx.py'yi çalıştırın.")
-        return None
-        
-    all_data = []
+    # --- YFINANCE FORMAT DÜZELTMESİ ---
+    # Sütunlar MultiIndex (katmanlı) gelirse düzleştirir
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    # ----------------------------------
+
+    # Veri boşsa kontrol et
+    if df.empty:
+        raise ValueError("Veri boş geldi. Sembolü kontrol edin.")
+
+    # --- ÖZNİTELİK MÜHENDİSLİĞİ (Feature Engineering) ---
     
-    for file_path in all_files:
-        df = pd.read_csv(file_path, index_col='Date', parse_dates=True)
-        df['Ticker'] = os.path.basename(file_path).split('_')[0]
-        all_data.append(df)
-        
-    combined_df = pd.concat(all_data)
-    combined_df.dropna(inplace=True)
+    # RSI (14 gün)
+    df["RSI"] = RSIIndicator(close=df["Close"], window=14).rsi()
     
-    print(f"Tüm veriler birleştirildi. Toplam satır: {len(combined_df)}")
-    return combined_df
-
-# --- MODEL EĞİTİMİ ---
-
-def train_and_save_model(data_df):
-    """Random Forest modelini yeni özelliklerle eğitir ve kaydeder."""
-
-    # Ticker sütununu sayısal kategoriye dönüştür
-    data_df['Ticker_Encoded'] = data_df['Ticker'].astype('category').cat.codes
-
-    # 1. Özellikleri (X) ve Hedefi (Y) Belirleme
-    features = [
-        'Close', 'Open', 'High', 'Low', 'Volume', 
-        'MA_10', 'RSI', 'Ticker_Encoded',
-        
-        # 👇 YENİ EKLEDİKLERİMİZ
-        'USD_TL',  # Dolar/TL kuru
-        'EUR_TL'   # Euro/TL kuru
-    ]
-    target = 'Target_Close'
+    # MACD
+    macd_indicator = MACD(close=df["Close"])
+    df["MACD"] = macd_indicator.macd()
     
-    X = data_df[features]
-    Y = data_df[target]
-
-    # 2. Eğitim ve Test Kümelerine Ayırma (Zamana bağlı ayırma)
-    split_point = int(len(X) * 0.80)
-    X_train, X_test = X[:split_point], X[split_point:]
-    Y_train, Y_test = Y[:split_point], Y[split_point:]
+    # Hareketli Ortalamalar (SMA 20 ve SMA 50)
+    # Not: SMA_50'yi feature listesinde kullandığınız için burada hesaplamalıyız.
+    df["SMA_20"] = SMAIndicator(close=df["Close"], window=20).sma_indicator()
+    df["SMA_50"] = SMAIndicator(close=df["Close"], window=50).sma_indicator()
     
-    print(f"Eğitim seti boyutu: {len(X_train)}, Test seti boyutu: {len(X_test)}")
-
-    # 3. Random Forest Modelini Eğitme
-    print("Model eğitimi başlıyor (Dolar/Euro dahil)...")
-    model = RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=-1)
-    model.fit(X_train, Y_train)
-    print("Model eğitimi tamamlandı.")
-
-    # 4. Performansı Değerlendirme
-    predictions = model.predict(X_test)
-    mse = mean_squared_error(Y_test, predictions)
-    r2 = r2_score(Y_test, predictions)
-
-    print(f"\n--- Model Performansı ---")
-    print(f"Hata Kare Ortalaması (MSE): {mse:.2f}")
-    print(f"R-Kare Skoru (R2): {r2:.2f}")
-
-    # 5. Modeli Kaydetme
-    joblib.dump(model, MODEL_PATH)
+    # HEDEF (Target) BELİRLEME
+    # 'Prediction' sütunu, bir sonraki günün 'Close' fiyatıdır.
+    df["Prediction"] = df["Close"].shift(-1)
     
-    # Modelin kullandığı Ticker kodlamasını da kaydetme (Backend API için kritik)
-    ticker_mapping = data_df[['Ticker', 'Ticker_Encoded']].drop_duplicates().set_index('Ticker').to_dict()['Ticker_Encoded']
-    joblib.dump(ticker_mapping, MAPPER_PATH)
-    
-    print(f"\nModel ve Eşleyici başarıyla kaydedildi: {os.path.basename(MODEL_PATH)} ve {os.path.basename(MAPPER_PATH)}")
+    return df
 
-# --- ANA ÇALIŞTIRMA ---
+# ANA AKIŞ
 if __name__ == "__main__":
-    combined_data = load_and_combine_data()
-    if combined_data is not None:
-        train_and_save_model(combined_data)
+    symbol = "GARAN.IS" # Örnek hisse
+    
+    try:
+        # 1. Veriyi Hazırla (İndikatörler ve Target dahil)
+        full_data = prepare_data(symbol)
+        
+        # 2. Gelecek Tahmini İçin Son Satırı Ayır
+        # Son satırın 'Prediction' değeri NaN'dır (çünkü yarın henüz olmadı).
+        # Bu satırı eğitimden çıkarıp, en sonda "Yarın"ı tahmin etmek için saklıyoruz.
+        features = ["RSI", "MACD", "SMA_20", "SMA_50", "Close"]
+        
+        # Gelecek tahmini için kullanılacak girdi (Bugünün kapanış verileri)
+        X_future_input = full_data.iloc[[-1]][features] 
+        
+        # 3. Eğitim Verisini Temizle
+        # İçinde NaN olan (ilk 50 gün ve son satır) verileri atıyoruz.
+        data_clean = full_data.dropna()
+        
+        # Özellikler (X) ve Hedef (y)
+        X = data_clean[features]
+        y = data_clean["Prediction"]
+        
+        # 4. Eğitim ve Test Bölünmesi
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
+        
+        # 5. Model Eğitimi
+        print("Model eğitiliyor...")
+        model = RandomForestRegressor(n_estimators=100, random_state=42)
+        model.fit(X_train, y_train)
+        
+        # 6. Test ve Değerlendirme
+        predictions = model.predict(X_test)
+        rmse = np.sqrt(mean_squared_error(y_test, predictions))
+        mae = mean_absolute_error(y_test, predictions)
+        
+        print(f"Model Başarısı (RMSE): {rmse:.2f} TL")
+        print(f"Ortalama Mutlak Hata (MAE): {mae:.2f} TL")
+        
+        # 7. GERÇEK ZAMANLI TAHMİN (YARIN İÇİN)
+        future_prediction = model.predict(X_future_input)
+        current_price = X_future_input["Close"].values[0]
+        
+        print(f"------------------------------------------------")
+        print(f"{symbol} Mevcut Fiyat: {current_price:.2f} TL")
+        print(f"Tahmin Edilen Yarınki Fiyat: {future_prediction[0]:.2f} TL")
+        
+        if future_prediction[0] > current_price:
+            print("Yön: YUKARI 🔼 (Potansiyel Alış Fırsatı)")
+        else:
+            print("Yön: AŞAĞI 🔽 (Düşüş Beklentisi)")
+            
+    except Exception as e:
+        print(f"Hata oluştu: {e}")
