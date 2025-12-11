@@ -1,218 +1,243 @@
-# Backend_API/app.py - NİHAİ VERSİYON (Tüm İsteKleri İçerir)
+# Backend_API/app.py - DÜZELTİLMİŞ NİHAİ VERSİYON
 
+from flask_cors import CORS
+from ta.momentum import RSIIndicator
+from ta.trend import SMAIndicator
 from flask import Flask, request, jsonify
 import joblib
 import pandas as pd
 import yfinance as yf
 from datetime import datetime, timedelta
 import os
-import numpy as np # CAGR hesaplaması için gerekli
+import numpy as np
 
 app = Flask(__name__)
+CORS(app) # Bu satır Frontend'in Backend ile konuşmasına izin verir
 
-# --- Model ve Harita Yollarını Tanımlama ---
-# Projenizin ana dizinini Windows'a uygun şekilde tanımlama
-BASE_DIR = "C:\\Users\\Berkay\\TRADEFIN" 
+# --- 1. DOSYA YOLLARI (DİNAMİK HALE GETİRİLDİ) ---
+# Bu dosyanın (app.py) bulunduğu klasörü al
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+# Bir üst klasöre çık (TRADEFIN ana klasörü)
+BASE_DIR = os.path.dirname(CURRENT_DIR)
 
+# Yolları birleştir
 MODEL_DIR = os.path.join(BASE_DIR, "ML_Model")
 MODEL_PATH = os.path.join(MODEL_DIR, "random_forest_model.joblib")
 TICKER_MAP_PATH = os.path.join(MODEL_DIR, "ticker_mapping.joblib")
-LONG_FX_MODEL_PATH = os.path.join(MODEL_DIR, "long_term_fx_model.joblib") 
+LONG_FX_MODEL_PATH = os.path.join(MODEL_DIR, "long_term_fx_model.joblib")
 
-# --- Model Yükleme ---
+# --- 2. MODELLERİ YÜKLEME ---
+stock_predictor = None
+ticker_mapping = {}
+
 try:
-    # Random Forest Modelini yükle
-    stock_predictor = joblib.load(MODEL_PATH)
-    ticker_mapping = joblib.load(TICKER_MAP_PATH)
-    print("API: Random Forest Model ve Ticker Haritası başarıyla yüklendi.")
+    if os.path.exists(MODEL_PATH):
+        stock_predictor = joblib.load(MODEL_PATH)
+        print("✅ API: Hisse Fiyat Modeli (Random Forest) yüklendi.")
+    else:
+        print(f"⚠️ UYARI: Model dosyası bulunamadı: {MODEL_PATH}")
+
+    if os.path.exists(TICKER_MAP_PATH):
+        ticker_mapping = joblib.load(TICKER_MAP_PATH)
+        print("✅ API: Ticker Haritası yüklendi.")
 except Exception as e:
-    print(f"API HATA: Random Forest Model yüklenemedi. {e}")
-    stock_predictor = None
-    ticker_mapping = {}
+    print(f"❌ API HATA: Model yüklenirken sorun oluştu: {e}")
 
-# NOT: long_fx_predictor artık global olarak yüklenmiyor, çağrıldığında yükleniyor (güvenlik için)
-
-# --- YARDIMCI FONKSİYONLAR ---
+# --- 3. YARDIMCI FONKSİYONLAR ---
 
 def fetch_real_time_fx():
-    """Anlık Dolar ve Euro kurlarını çeker."""
+    """Anlık Dolar ve Euro kurlarını çeker (Yfinance MultiIndex Düzeltmesi ile)."""
     fx_tickers = ['USDTRY=X', 'EURTRY=X']
-    
     try:
-        # yfinance ile anlık veriyi çekme
-        fx_data = yf.download(fx_tickers, period="1d")['Close'].iloc[-1].to_dict()
+        # period='1d' son kapanışı getirir
+        df = yf.download(fx_tickers, period="1d", progress=False)
+        
+        # Yfinance MultiIndex Düzeltmesi
+        if isinstance(df.columns, pd.MultiIndex):
+            # Sadece 'Close' fiyatlarını al ve ticker isimlerine indirge
+            df = df.xs('Close', axis=1, level=0)
+        elif 'Close' in df.columns:
+             df = df['Close']
+        
+        # Son satırı al (Series döner)
+        last_rates = df.iloc[-1]
+        
         return {
-            "USD_TL": fx_data.get('USDTRY=X'),
-            "EUR_TL": fx_data.get('EURTRY=X')
+            "USD_TL": float(last_rates.get('USDTRY=X', 0)),
+            "EUR_TL": float(last_rates.get('EURTRY=X', 0))
         }
-    except Exception:
+    except Exception as e:
+        print(f"FX Çekme Hatası: {e}")
         return {"USD_TL": None, "EUR_TL": None}
 
 def calculate_input_features(latest_data_series, fx_rates, ticker_encoded):
-    """Tahmin için modelin beklediği DataFrame'i hazırlar."""
-    # Modelin beklediği tüm 10 özellik (Close'dan EUR_TL'ye kadar) buraya dahil edilmeli
+    """Tahmin için DataFrame hazırlar. Model eğitimiyle AYNI SIRADA olmalı."""
     input_features = {
-        'Close': [latest_data_series['Close']],
-        'Open': [latest_data_series['Open']],
-        'High': [latest_data_series['High']],
-        'Low': [latest_data_series['Low']],
-        'Volume': [latest_data_series['Volume']],
-        'MA_10': [latest_data_series['MA_10']],
-        'RSI': [latest_data_series['RSI']], 
+        'Close': [latest_data_series.get('Close')],
+        'Open': [latest_data_series.get('Open')],
+        'High': [latest_data_series.get('High')],
+        'Low': [latest_data_series.get('Low')],
+        'Volume': [latest_data_series.get('Volume')],
+        'MA_10': [latest_data_series.get('MA_10')],
+        'RSI': [latest_data_series.get('RSI')],
         'Ticker_Encoded': [ticker_encoded],
         'USD_TL': [fx_rates['USD_TL']],
         'EUR_TL': [fx_rates['EUR_TL']]
     }
-    
     return pd.DataFrame(input_features)
 
-# --- 5. API UÇ NOKTALARI (ROUTES) ---
+# --- 4. API UÇ NOKTALARI (ROUTES) ---
 
 @app.route('/api/predict', methods=['POST'])
 def predict_stock_price():
-    """Hisse senedi için bir sonraki gün kapanış fiyatını tahmin eder."""
     if stock_predictor is None:
-        return jsonify({"error": "Makine Öğrenimi Modeli Yüklenemedi."}), 500
+        return jsonify({"error": "Model sunucuda yüklü değil."}), 503
 
     data = request.get_json()
-    required_features = ['Close', 'Open', 'High', 'Low', 'Volume', 'MA_10', 'RSI'] 
-    
-    if 'Ticker' not in data or not all(f in data for f in required_features):
-        return jsonify({"error": "Eksik parametreler. Ticker ve son günün tüm teknik göstergeleri gereklidir."}), 400
+    ticker = data.get('Ticker') # Frontend sadece bunu gönderiyor
 
-    ticker = data['Ticker']
-    
-    if ticker not in ticker_mapping:
-        return jsonify({"error": f"Bilinmeyen hisse kodu: {ticker}"}), 400
-        
+    if not ticker:
+        return jsonify({"error": "Ticker parametresi zorunludur."}), 400
+
     try:
-        # 1. Anlık Kur Verisini Çekme
+        # --- OTOMATİK VERİ TAMAMLAMA (FRONTEND İÇİN) ---
+        # Frontend teknik verileri göndermiyorsa, biz çekelim
+        symbol = f"{ticker}.IS"
+        df = yf.download(symbol, period="1y", progress=False)
+        
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+            
+        if df.empty:
+            return jsonify({"error": "Hisse verisi bulunamadı."}), 404
+
+        # Teknik İndikatörleri Hesapla (Modelin istediği formatta)
+        df['RSI'] = RSIIndicator(close=df["Close"], window=14).rsi()
+        df['MA_10'] = SMAIndicator(close=df["Close"], window=10).sma_indicator() # Model MA_10 istiyorsa
+        
+        last_row = df.iloc[-1]
+
+        # Model girdilerini hazırla
+        input_data_dict = {
+            'Ticker': ticker,
+            'Close': last_row['Close'],
+            'Open': last_row['Open'],
+            'High': last_row['High'],
+            'Low': last_row['Low'],
+            'Volume': last_row['Volume'],
+            'MA_10': last_row.get('MA_10', last_row['Close']), # MA_10 yoksa Close kullan (Fallback)
+            'RSI': last_row.get('RSI', 50) # RSI yoksa 50 kullan
+        }
+        
+        # --- DEVAMI AYNI ---
+        ticker_encoded = ticker_mapping.get(ticker, 0)
+        
         fx_rates = fetch_real_time_fx()
         if fx_rates['USD_TL'] is None:
-            return jsonify({"error": "Anlık Dolar/Euro kurları çekilemedi."}), 500
-            
-        # 2. Girdiyi Modela Uygun Hale Getirme
-        ticker_encoded = ticker_mapping[ticker]
-        latest_data_series = pd.Series(data) 
-        input_df = calculate_input_features(latest_data_series, fx_rates, ticker_encoded)
-        
-        # 3. Tahmin Yapma
+            fx_rates = {"USD_TL": 34.50, "EUR_TL": 36.50}
+
+        input_df = calculate_input_features(input_data_dict, fx_rates, ticker_encoded)
         prediction = stock_predictor.predict(input_df)
-        
-        # 4. Sonucu Döndürme
+
         return jsonify({
             "ticker": ticker,
-            "predicted_close": round(prediction[0], 2),
+            "predicted_close": round(float(prediction[0]), 2),
             "prediction_date": (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d'),
             "kullanilan_usd_tl": round(fx_rates['USD_TL'], 2)
         })
 
     except Exception as e:
-        print(f"Tahmin hatası: {e}")
-        return jsonify({"error": f"Tahmin sırasında bilinmeyen bir hata oluştu: {str(e)}"}), 500
-
-
+        print(f"Hata detayı: {e}")
+        return jsonify({"error": f"Tahmin hatası: {str(e)}"}), 500
+    
 @app.route('/api/fx/current', methods=['GET'])
 def get_current_fx():
-    """Anlık Dolar ve Euro kurlarını döndürür (Web panosundaki anlık değişimler için)."""
+    """Frontend Header'ı için anlık kurlar."""
     fx_rates = fetch_real_time_fx()
-    
     if fx_rates['USD_TL'] is None:
-         return jsonify({"error": "Anlık Dolar/Euro kurları çekilemedi."}), 500
-
+        return jsonify({"error": "Kur verisi alınamadı"}), 500
+        
     return jsonify({
-        "USD_TL": round(fx_rates['USD_TL'], 2),
-        "EUR_TL": round(fx_rates['EUR_TL'], 2)
+        "USD_TL": round(fx_rates['USD_TL'], 4),
+        "EUR_TL": round(fx_rates['EUR_TL'], 4)
     })
-
 
 @app.route('/api/fx/long_term', methods=['GET'])
 def get_long_term_fx():
-    """
-    İstenilen: Uzun vadeli kur projeksiyonu.
-    Query parametresi: ?target_date=YYYY-MM-DD
-    """
-    # Projeksiyon verilerini yükle
+    """Uzun vadeli FX projeksiyonu (Zaman çizelgesi veya spesifik tarih)."""
     try:
         fx_projections = joblib.load(LONG_FX_MODEL_PATH)
+    except FileNotFoundError:
+        return jsonify({"error": "Uzun vadeli FX modeli bulunamadı. Lütfen modeli eğitin."}), 404
     except Exception as e:
-        print(f"Uzun vadeli FX projeksiyon verisi yüklenemedi: {e}")
-        return jsonify({"error": "Uzun vadeli FX projeksiyon verisi hazır değil. long_term_fx_model.py'yi çalıştırın."}), 503
+        return jsonify({"error": str(e)}), 500
 
-    # 2. Query Parametresini Kontrol Etme
     target_date_str = request.args.get('target_date')
-    
-    # 2.A: Spesifik Tarih İsteği (Örn: 2026-01-05)
+
+    # SENARYO A: Spesifik bir tarih isteniyorsa
     if target_date_str:
         try:
             target_date = pd.to_datetime(target_date_str)
+            start_date_str = fx_projections.get('PROJECTION_START_DATE') or fx_projections.get('PROJECTION_START')
+            start_date = pd.to_datetime(start_date_str)
             
-            # Projeksiyon başlangıç verilerini timeline'ın ilk ve son noktasından alıyoruz
-            usd_start_date = pd.to_datetime(fx_projections['PROJECTION_START'])
+            # Kaydedilmiş son gerçek değerleri kullan (Daha hassas hesaplama için)
+            # Eğer modelinizde 'LAST_USD_VALUE' yoksa timeline'ın ilk elemanını kullanırız
+            last_usd = fx_projections.get('LAST_USD_VALUE', fx_projections['USD_TL_TIMELINE'][0]['Value'])
+            last_eur = fx_projections.get('LAST_EUR_VALUE', fx_projections['EUR_TL_TIMELINE'][0]['Value'])
             
-            # Kaydedilen CAGR oranları
             usd_cagr = fx_projections['USD_CAGR']
             eur_cagr = fx_projections['EUR_CAGR']
-
-            # En son bilinen kur değeri (Timeline'ın ilk noktası, yani bugünün kuru)
-            last_usd_rate = fx_projections['USD_TL_TIMELINE'][0]['Value']
-            last_eur_rate = fx_projections['EUR_TL_TIMELINE'][0]['Value']
             
-            # Güncel tarihten hedef tarihe kadar geçen yıl sayısı
-            proj_years = (target_date - usd_start_date).days / 365.25
+            # Yıl farkı hesabı
+            proj_years = (target_date - start_date).days / 365.25
             
-            # Geçmiş bir tarih istenirse hata ver
             if proj_years < 0:
-                return jsonify({"error": "Tahmin tarihi bugünden sonra olmalıdır."}), 400
-            
-            # Projeksiyon hesaplama
-            predicted_usd = last_usd_rate * ((1 + usd_cagr) ** proj_years)
-            predicted_eur = last_eur_rate * ((1 + eur_cagr) ** proj_years)
+                return jsonify({"error": "Geçmiş bir tarih için tahmin yapılamaz."}), 400
+
+            pred_usd = last_usd * ((1 + usd_cagr) ** proj_years)
+            pred_eur = last_eur * ((1 + eur_cagr) ** proj_years)
 
             return jsonify({
                 "tahmin_tarihi": target_date_str,
-                "usd_tl_tahmini": round(predicted_usd, 2),
-                "eur_tl_tahmini": round(predicted_eur, 2),
-                "tip": "Spesifik Tarih Projeksiyonu"
+                "usd_tl_tahmini": round(pred_usd, 2),
+                "eur_tl_tahmini": round(pred_eur, 2)
             })
-            
         except Exception as e:
-            return jsonify({"error": f"Tarih formatı veya hesaplama hatası: {str(e)}"}), 400
+            return jsonify({"error": f"Hesaplama hatası: {str(e)}"}), 400
 
-    # 2.B: Tüm Zaman Çizelgesi İsteği (Web Grafiği için)
+    # SENARYO B: Tüm zaman çizelgesi isteniyorsa (Grafik için)
     else:
         return jsonify({
             "USD_TL_Timeline": fx_projections['USD_TL_TIMELINE'],
             "EUR_TL_Timeline": fx_projections['EUR_TL_TIMELINE'],
-            "başlangıç_tarihi": fx_projections['PROJECTION_START'],
-            "tip": "Tüm Zaman Çizelgesi"
+            "baslangic_tarihi": fx_projections.get('PROJECTION_START_DATE')
         })
-
 
 @app.route('/api/history/<ticker>', methods=['GET'])
 def get_history(ticker):
-    """Grafik çizimi için hissenin son 90 günlük geçmişini döndürür."""
-    
-    ticker_yf = f"{ticker}.IS"
-    end_date = datetime.now()
-    start_date = end_date - timedelta(days=90) 
-    
+    """Grafik çizimi için son 90 günlük geçmiş."""
     try:
-        data = yf.download(ticker_yf, start=start_date.strftime('%Y-%m-%d'), end=end_date.strftime('%Y-%m-%d'))
+        symbol = f"{ticker}.IS"
+        # Yfinance MultiIndex Düzeltmesi (history için)
+        df = yf.download(symbol, period="3mo", progress=False)
         
-        if data.empty:
-            return jsonify({"error": f"Geçmiş veri çekilemedi: {ticker}"}), 404
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+            
+        if df.empty:
+            return jsonify({"error": "Veri bulunamadı"}), 404
+            
+        # Tarihi string'e çevir ve listeye dönüştür
+        df = df.reset_index()
+        df['Date'] = df['Date'].dt.strftime('%Y-%m-%d')
+        result = df[['Date', 'Close']].to_dict('records')
         
-        # Sadece grafik için gerekli olan verileri döndür
-        history_data = data[['Close']].reset_index()
-        history_data['Date'] = history_data['Date'].dt.strftime('%Y-%m-%d')
+        return jsonify(result)
         
-        return jsonify(history_data.to_dict('records'))
-
-    except Exception:
-        return jsonify({"error": "Geçmiş veri çekilirken hata oluştu."}), 500
-
+    except Exception as e:
+        return jsonify({"error": f"Geçmiş veri hatası: {str(e)}"}), 500
 
 if __name__ == '__main__':
-    # Flask'ı debug modunda çalıştırıyoruz
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    print("🚀 Backend API Çalışıyor (Port 5000)...")
+    app.run(debug=True, port=5000)
