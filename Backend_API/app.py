@@ -211,7 +211,10 @@ def get_long_term_fx():
         return jsonify({
             "USD_TL_Timeline": fx_projections['USD_TL_TIMELINE'],
             "EUR_TL_Timeline": fx_projections['EUR_TL_TIMELINE'],
-            "baslangic_tarihi": fx_projections.get('PROJECTION_START_DATE')
+            "baslangic_tarihi": fx_projections.get('PROJECTION_START_DATE'),
+            # --- EKLENEN SATIRLAR ---
+            "USD_CAGR": fx_projections.get('USD_CAGR', 0),
+            "EUR_CAGR": fx_projections.get('EUR_CAGR', 0)
         })
 
 @app.route('/api/history/<ticker>', methods=['GET'])
